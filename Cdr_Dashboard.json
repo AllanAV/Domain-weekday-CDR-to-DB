@@ -1,0 +1,231 @@
+{
+  "_comment_1": "This workflow fetches CDRs from a database and displays them in a dashboard.",
+  "_comment_2": "Author: Allan Aquino Vieira",
+  "name": "CDR Dashboard",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "your-cdr-dashboard-path",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -768,
+        0
+      ],
+      "id": "f26fae0b-44c4-46be-8b64-37273e18f967",
+      "name": "Webhook — CDR Dashboard",
+      "webhookId": "REDACTED"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a rolling date window from today back N days.\n// DAYS_BACK comes from the Config node.\n\nconst cfg      = $input.first().json;\nconst daysBack = cfg.DAYS_BACK || 30;\n\nconst pad = n => String(n).padStart(2, '0');\n\nconst now  = new Date();\nconst from = new Date(now);\nfrom.setDate(now.getDate() - daysBack);\n\nconst fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;\n\nreturn [{\n  json: {\n    DOMAIN:     cfg.DOMAIN,\n    BASE_URL:   cfg.BASE_URL,\n    DAYS_BACK:  daysBack,\n    DATE_FROM:  fmt(from) + ' 00:00:00',\n    DATE_TO:    fmt(now)  + ' 23:59:59',\n    LABEL_FROM: fmt(from),\n    LABEL_TO:   fmt(now)\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -352,
+        0
+      ],
+      "id": "24e80a10-d912-4ca5-8d40-4bf48f423fa4",
+      "name": "Calculate Date Range"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  -- Identity\n  cdr_id,\n  domain,\n  reseller,\n\n  -- Call basics\n  call_direction,\n  call_start_datetime,\n  call_batch_start_datetime,\n  call_batch_sequence_marker,\n  call_talking_duration_seconds,\n  call_total_duration_seconds,\n  call_on_hold_duration_seconds,\n  call_disconnect_reason_text,\n  call_batch_total_duration_seconds,\n\n  -- Caller info\n  call_orig_caller_id,\n  call_orig_from_name,\n  call_orig_domain,\n  call_orig_ip_address,\n\n  -- Called party\n  call_term_user,\n  call_term_domain,\n  call_term_caller_id,\n\n  -- Transfer / forward\n  call_through_user,\n  call_through_action,\n  call_through_domain,\n\n  -- Sentiment & intelligence\n  call_intelligence_percent_positive,\n  call_intelligence_percent_neutral,\n  call_intelligence_percent_negative,\n  call_intelligence_topics_top,\n  ending_sentiment,\n\n  -- Disposition\n  call_disposition,\n  call_disposition_reason,\n  call_account_code,\n\n  -- ══ FUTURE FEATURE FIELDS ══════════════════════════\n  -- Transcription API: GET /domains/{domain}/transcriptions\n  -- Required params: id, date (YYYYMM), orig_callid, term_callid\n  call_intelligence_job_id,\n  call_orig_call_id,\n  call_term_call_id,\n  prefilled_transcription_api,\n\n  -- Recording API: GET /domains/{domain}/users/{user}/recordings/{callid}\n  -- Required params: user (call_term_user), callid (call_orig_call_id)\n  -- call_term_user and call_orig_call_id already selected above\n\n  -- SIP Trace\n  prefilled_trace_api,\n  is_trace_expected\n\nFROM netsapiens_cdrs\nWHERE call_batch_start_datetime >= '{{ $json.DATE_FROM }}'\n  AND call_batch_start_datetime <= '{{ $json.DATE_TO }}'\nORDER BY call_batch_start_datetime DESC\nLIMIT 5000;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -144,
+        0
+      ],
+      "id": "77ae3fdb-94d6-48e1-8c83-14c6bbd9c358",
+      "name": "Query Supabase CDRs",
+      "credentials": {
+        "postgres": {
+          "id": "REDACTED",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Strip device-type suffixes from Netsapiens user IDs ──────\n// Netsapiens appends suffixes to extension numbers:\n// 775  → physical desk phone (base user)\n// 775t → softphone/trunk device\n// 775wp → web portal / SNAPmobile Web\n// 775i → iOS SNAPmobile app\n// 775m → mobile / Android\n// 775ai → AI agent / virtual device\n// Longest suffixes must be checked first (wp before p, ai before i)\n\nconst SUFFIXES = ['wp', 'ai', 't', 'i', 'm'];\n\nfunction getBaseUser(user) {\n  if (!user) return null;\n  const s = String(user).trim();\n  for (const suffix of SUFFIXES) {\n    if (s.toLowerCase().endsWith(suffix)) {\n      return s.slice(0, s.length - suffix.length);\n    }\n  }\n  return s;\n}\n\n// Add base_user to every CDR record.\n// We derive it from call_term_user (the called/internal party).\n// call_through_user is used as fallback for forwarded calls.\nconst enriched = $input.all().map(item => {\n  const raw = item.json;\n  const userSource = raw.call_term_user || raw.call_through_user || null;\n  return {\n    json: {\n      ...raw,\n      base_user:   getBaseUser(userSource),\n      device_type: getDeviceType(userSource)\n    }\n  };\n});\n\nfunction getDeviceType(user) {\n  if (!user) return 'unknown';\n  const s = String(user).toLowerCase().trim();\n  if (s.endsWith('wp'))  return 'Web Portal';\n  if (s.endsWith('ai'))  return 'AI Agent';\n  if (s.endsWith('t'))   return 'Softphone';\n  if (s.endsWith('i'))   return 'iOS App';\n  if (s.endsWith('m'))   return 'Mobile App';\n  return 'Desk Phone';\n}\n\nif (enriched.length === 0) {\n  return [{ json: { _empty: true, records: [] } }];\n}\n\n// Pass all records as a single JSON array on one item.\n// The dashboard builder (next node) needs the full dataset.\nreturn [{\n  json: {\n    records: enriched.map(i => i.json),\n    total:   enriched.length\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        64,
+        0
+      ],
+      "id": "c82d2002-f219-43f0-9984-8b1e064ddef8",
+      "name": "Group by Base User"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── CDR Dashboard HTML Builder ─────────────────────────────\n// FIXED: No nested template literals. All HTML/JS built with\n// string concatenation to avoid n8n runtime syntax errors.\n\nconst input   = $input.first().json;\nconst records = input.records || [];\n\n// Safely encode records for embedding in HTML\nconst dataJson = JSON.stringify(records)\n  .replace(/</g, '\\\\u003c')\n  .replace(/>/g, '\\\\u003e')\n  .replace(/&/g, '\\\\u0026');\n\n// ── CSS ────────────────────────────────────────────────────\nconst css = [\n  \"@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=JetBrains+Mono:wght@400;500&family=Lato:wght@300;400&display=swap');\",\n  \":root{--bg:#080b10;--s1:#0e1420;--s2:#141d2e;--s3:#1a2540;--border:#1e304e;--accent:#00c8f8;--green:#10b981;--red:#f43f5e;--warn:#f59e0b;--text:#c8d5ea;--muted:#3d5070;--r:8px}\",\n  \"*{box-sizing:border-box;margin:0;padding:0}\",\n  \"body{background:var(--bg);color:var(--text);font-family:'Lato',sans-serif;font-size:14px;line-height:1.6;min-height:100vh}\",\n  \"h1,h2{font-family:'Syne',sans-serif}\",\n  \"code{font-family:'JetBrains Mono',monospace}\",\n  \".topbar{background:var(--s1);border-bottom:1px solid var(--border);padding:16px 32px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}\",\n  \".topbar h1{font-size:18px;font-weight:800;color:#fff;letter-spacing:-0.02em}\",\n  \".topbar h1 span{color:var(--accent)}\",\n  \".topbar-right{display:flex;align-items:center;gap:12px}\",\n  \".count-badge{font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--s3);border:1px solid var(--border);border-radius:5px;padding:4px 10px;color:var(--accent)}\",\n  \".filters{background:var(--s1);border-bottom:1px solid var(--border);padding:14px 32px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end}\",\n  \".fg{display:flex;flex-direction:column;gap:4px;min-width:140px}\",\n  \".fg label{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted)}\",\n  \"select,input[type=text]{background:var(--s2);border:1px solid var(--border);border-radius:5px;color:var(--text);padding:5px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;outline:none;cursor:pointer;min-width:120px}\",\n  \"input[type=range]{-webkit-appearance:none;height:4px;cursor:pointer;width:120px;accent-color:var(--accent)}\",\n  \".rw{display:flex;align-items:center;gap:8px}\",\n  \".rv{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent);min-width:40px}\",\n  \".btn{font-family:'JetBrains Mono',monospace;font-size:11px;border:none;border-radius:5px;padding:6px 14px;cursor:pointer;transition:all 0.15s;font-weight:500}\",\n  \".bp{background:var(--accent);color:#02080e}\",\n  \".bp:hover{opacity:0.85}\",\n  \".bo{background:transparent;border:1px solid var(--border);color:var(--text)}\",\n  \".bo:hover{background:var(--s2);border-color:var(--accent);color:var(--accent)}\",\n  \".sbtns{display:flex;gap:4px}\",\n  \".sb{font-family:'JetBrains Mono',monospace;font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--s3);color:var(--muted);cursor:pointer;transition:all 0.15s}\",\n  \".sp{background:#082018;border-color:var(--green);color:var(--green)}\",\n  \".sn{background:#0a1020;border-color:#60a5fa;color:#60a5fa}\",\n  \".sg{background:#1a0810;border-color:var(--red);color:var(--red)}\",\n  \".summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;padding:20px 32px}\",\n  \".card{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);padding:16px;transition:border-color 0.2s}\",\n  \".card:hover{border-color:var(--accent)}\",\n  \".cl{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:6px}\",\n  \".cv{font-family:'Syne',sans-serif;font-size:24px;font-weight:800;color:#fff}\",\n  \".cv.green{color:var(--green)}.cv.red{color:var(--red)}.cv.warn{color:var(--warn)}.cv.blue{color:var(--accent)}\",\n  \".ts{padding:8px 32px 32px}\",\n  \".ub{background:var(--s1);border:1px solid var(--border);border-radius:var(--r);margin-bottom:10px;overflow:hidden}\",\n  \".uh{display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer;user-select:none;transition:background 0.15s}\",\n  \".uh:hover{background:var(--s2)}\",\n  \".ue{font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#fff;min-width:60px}\",\n  \".us{display:flex;gap:12px;flex:1;flex-wrap:wrap}\",\n  \".ut{font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--s3);border:1px solid var(--border);border-radius:4px;padding:3px 8px;color:var(--muted)}\",\n  \".ut.pos{border-color:var(--green);color:var(--green)}\",\n  \".ut.neg{border-color:var(--red);color:var(--red)}\",\n  \".ut.dur{border-color:var(--warn);color:var(--warn)}\",\n  \".ei{color:var(--muted);font-size:12px;margin-left:auto;transition:transform 0.2s}\",\n  \".ub.open .ei{transform:rotate(90deg)}\",\n  \".ct{width:100%;border-collapse:collapse;display:none}\",\n  \".ub.open .ct{display:table}\",\n  \".ct th{background:var(--s2);font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:var(--muted);padding:8px 12px;text-align:left;border-top:1px solid var(--border)}\",\n  \".ct td{padding:8px 12px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}\",\n  \".ct tr:last-child td{border-bottom:none}\",\n  \".ct tr:hover td{background:var(--s2)}\",\n  \".di{color:var(--green);font-family:'JetBrains Mono',monospace;font-size:11px}\",\n  \".do{color:#60a5fa;font-family:'JetBrains Mono',monospace;font-size:11px}\",\n  \".dm{color:var(--red);font-family:'JetBrains Mono',monospace;font-size:11px}\",\n  \".sb-bar{display:flex;gap:2px;align-items:center}\",\n  \".ss{height:6px;border-radius:2px}\",\n  \".spos{background:var(--green)}.sneu{background:#60a5fa}.sneg{background:var(--red)}\",\n  \".sl{font-family:'JetBrains Mono',monospace;font-size:10px;margin-left:4px;color:var(--muted)}\",\n  \".ab{display:flex;gap:4px}\",\n  \".ac{font-family:'JetBrains Mono',monospace;font-size:10px;padding:3px 8px;border-radius:4px;border:1px solid var(--border);background:var(--s3);color:var(--muted);cursor:not-allowed;opacity:0.4}\",\n  \".nr{text-align:center;padding:40px;color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:12px}\"\n].join('');\n\n// ── Embedded JS (no template literals - uses string concat) ─\nconst embeddedJs = [\n  \"var ALL = \" + dataJson + \";\",\n  \"var activeSent = {};\",\n  \"var filtered = ALL.slice();\",\n\n  \"function dirLabel(d){\",\n  \"  if(d==1||d==='Inbound')  return {l:'INBOUND', c:'di'};\",\n  \"  if(d==2||d==='Outbound') return {l:'OUTBOUND',c:'do'};\",\n  \"  if(d==3||d==='Missed')   return {l:'MISSED',  c:'dm'};\",\n  \"  return {l:String(d||'?'),c:'di'};\",\n  \"}\",\n\n  \"function fmtDur(s){\",\n  \"  if(!s)return '—';\",\n  \"  var m=Math.floor(s/60),sec=s%60;\",\n  \"  return m>0 ? m+'m '+sec+'s' : sec+'s';\",\n  \"}\",\n\n  \"function fmtDt(dt){\",\n  \"  if(!dt)return '—';\",\n  \"  try{return new Date(dt).toLocaleString();}catch(e){return dt;}\",\n  \"}\",\n\n  \"function domSent(r){\",\n  \"  var pos=r.call_intelligence_percent_positive||0;\",\n  \"  var neu=r.call_intelligence_percent_neutral||0;\",\n  \"  var neg=r.call_intelligence_percent_negative||0;\",\n  \"  if(!pos&&!neu&&!neg)return null;\",\n  \"  if(pos>=neu&&pos>=neg)return 'pos';\",\n  \"  if(neg>=pos&&neg>=neu)return 'neg';\",\n  \"  return 'neu';\",\n  \"}\",\n\n  \"function toggleSent(type){\",\n  \"  activeSent[type]=!activeSent[type];\",\n  \"  var btnMap={pos:'bPos',neu:'bNeu',neg:'bNeg'};\",\n  \"  var clsMap={pos:'sb sp',neu:'sb sn',neg:'sb sg'};\",\n  \"  for(var k in btnMap){\",\n  \"    var el=document.getElementById(btnMap[k]);\",\n  \"    el.className=activeSent[k]?clsMap[k]:'sb';\",\n  \"  }\",\n  \"  applyFilters();\",\n  \"}\",\n\n  \"function resetFilters(){\",\n  \"  document.getElementById('fDir').value='';\",\n  \"  document.getElementById('fDur').value=0;\",\n  \"  document.getElementById('fDurV').textContent='0';\",\n  \"  document.getElementById('fST').value=0;\",\n  \"  document.getElementById('fSTV').textContent='0%';\",\n  \"  document.getElementById('fUser').value='';\",\n  \"  activeSent={};\",\n  \"  ['bPos','bNeu','bNeg'].forEach(function(id){document.getElementById(id).className='sb';});\",\n  \"  applyFilters();\",\n  \"}\",\n\n  \"function applyFilters(){\",\n  \"  var dir=document.getElementById('fDir').value;\",\n  \"  var minDur=parseInt(document.getElementById('fDur').value)||0;\",\n  \"  var thresh=parseInt(document.getElementById('fST').value)||0;\",\n  \"  var userQ=(document.getElementById('fUser').value||'').toLowerCase().trim();\",\n  \"  var hasSent=activeSent.pos||activeSent.neu||activeSent.neg;\",\n  \"  filtered=ALL.filter(function(r){\",\n  \"    if(dir&&String(r.call_direction)!==dir)return false;\",\n  \"    if(minDur>0&&(r.call_talking_duration_seconds||0)<minDur)return false;\",\n  \"    if(userQ&&!(r.base_user||'').toLowerCase().includes(userQ))return false;\",\n  \"    if(hasSent){\",\n  \"      var dom=domSent(r);\",\n  \"      if(!activeSent[dom])return false;\",\n  \"    }\",\n  \"    if(thresh>0&&hasSent){\",\n  \"      var pass=false;\",\n  \"      if(activeSent.pos&&(r.call_intelligence_percent_positive||0)>=thresh)pass=true;\",\n  \"      if(activeSent.neu&&(r.call_intelligence_percent_neutral||0)>=thresh)pass=true;\",\n  \"      if(activeSent.neg&&(r.call_intelligence_percent_negative||0)>=thresh)pass=true;\",\n  \"      if(!pass)return false;\",\n  \"    }\",\n  \"    return true;\",\n  \"  });\",\n  \"  renderDashboard();\",\n  \"}\",\n\n  \"function renderCards(recs){\",\n  \"  var total=recs.length;\",\n  \"  var avgDur=total?Math.round(recs.reduce(function(a,r){return a+(r.call_talking_duration_seconds||0);},0)/total):0;\",\n  \"  var avgPos=total?Math.round(recs.reduce(function(a,r){return a+(r.call_intelligence_percent_positive||0);},0)/total):0;\",\n  \"  var avgNeg=total?Math.round(recs.reduce(function(a,r){return a+(r.call_intelligence_percent_negative||0);},0)/total):0;\",\n  \"  var missed=recs.filter(function(r){return String(r.call_direction)==='3';}).length;\",\n  \"  var users=recs.reduce(function(acc,r){if(r.base_user)acc[r.base_user]=1;return acc;},{});\",\n  \"  var cards=[\",\n  \"    {l:'Total Calls',v:total,c:'blue'},\",\n  \"    {l:'Unique Users',v:Object.keys(users).length,c:''},\",\n  \"    {l:'Avg Duration',v:fmtDur(avgDur),c:'warn'},\",\n  \"    {l:'Avg Positive',v:avgPos+'%',c:'green'},\",\n  \"    {l:'Avg Negative',v:avgNeg+'%',c:'red'},\",\n  \"    {l:'Missed Calls',v:missed,c:'red'}\",\n  \"  ];\",\n  \"  document.getElementById('cards').innerHTML=cards.map(function(c){\",\n  \"    return '<div class=\\\"card\\\"><div class=\\\"cl\\\">'+c.l+'</div><div class=\\\"cv '+c.c+'\\\">'+c.v+'</div></div>';\",\n  \"  }).join('');\",\n  \"  document.getElementById('cnt').textContent=total+' calls';\",\n  \"}\",\n\n  \"function renderDashboard(){\",\n  \"  renderCards(filtered);\",\n  \"  var groups={};\",\n  \"  filtered.forEach(function(r){\",\n  \"    var k=r.base_user||'(unknown)';\",\n  \"    if(!groups[k])groups[k]=[];\",\n  \"    groups[k].push(r);\",\n  \"  });\",\n  \"  var sec=document.getElementById('tbl');\",\n  \"  var keys=Object.keys(groups).sort(function(a,b){return groups[b].length-groups[a].length;});\",\n  \"  if(!keys.length){sec.innerHTML='<div class=\\\"nr\\\">No calls match the current filters.</div>';return;}\",\n  \"  sec.innerHTML=keys.map(function(user){\",\n  \"    var calls=groups[user];\",\n  \"    var totDur=calls.reduce(function(a,r){return a+(r.call_talking_duration_seconds||0);},0);\",\n  \"    var avgPos=Math.round(calls.reduce(function(a,r){return a+(r.call_intelligence_percent_positive||0);},0)/calls.length);\",\n  \"    var avgNeg=Math.round(calls.reduce(function(a,r){return a+(r.call_intelligence_percent_negative||0);},0)/calls.length);\",\n  \"    var rows=calls.map(function(r){\",\n  \"      var d=dirLabel(r.call_direction);\",\n  \"      var pos=r.call_intelligence_percent_positive||0;\",\n  \"      var neu=r.call_intelligence_percent_neutral||0;\",\n  \"      var neg=r.call_intelligence_percent_negative||0;\",\n  \"      var hasSt=pos||neu||neg;\",\n  \"      var sentHtml=hasSt\",\n  \"        ? '<div class=\\\"sb-bar\\\"><div class=\\\"ss spos\\\" style=\\\"width:'+(pos*0.6)+'px\\\" title=\\\"Pos '+pos+'%\\\"></div><div class=\\\"ss sneu\\\" style=\\\"width:'+(neu*0.6)+'px\\\" title=\\\"Neu '+neu+'%\\\"></div><div class=\\\"ss sneg\\\" style=\\\"width:'+(neg*0.6)+'px\\\" title=\\\"Neg '+neg+'%\\\"></div><span class=\\\"sl\\\">'+pos+'·'+neu+'·'+neg+'</span></div>'\",\n  \"        : '<span style=\\\"color:var(--muted);font-size:11px\\\">no data</span>';\",\n  \"      var tUrl=r.prefilled_transcription_api||'';\",\n  \"      var rUser=r.call_term_user||'';\",\n  \"      var rCid=r.call_orig_call_id||'';\",\n  \"      return '<tr>'\",\n  \"        +'<td><span class=\\\"'+d.c+'\\\">'+d.l+'</span></td>'\",\n  \"        +'<td style=\\\"color:var(--text)\\\">'+fmtDt(r.call_batch_start_datetime)+'</td>'\",\n  \"        +'<td style=\\\"color:var(--warn);font-family:JetBrains Mono,monospace\\\">'+fmtDur(r.call_talking_duration_seconds)+'</td>'\",\n  \"        +'<td style=\\\"font-family:JetBrains Mono,monospace;font-size:11px;color:#94a3b8\\\">'+(r.call_orig_caller_id||'—')+'<br><span style=\\\"color:var(--muted);font-size:10px\\\">'+(r.call_orig_from_name||'')+'</span></td>'\",\n  \"        +'<td style=\\\"font-family:JetBrains Mono,monospace;font-size:11px;color:var(--muted)\\\">'+(r.device_type||'—')+'</td>'\",\n  \"        +'<td>'+sentHtml+'</td>'\",\n  \"        +'<td><div class=\\\"ab\\\">'\",\n  \"          +'<button class=\\\"ac\\\" data-t=\\\"'+tUrl+'\\\" title=\\\"Transcription coming soon\\\">&#x1F4DD;</button>'\",\n  \"          +'<button class=\\\"ac\\\" data-ru=\\\"'+rUser+'\\\" data-rc=\\\"'+rCid+'\\\" title=\\\"Recording coming soon\\\">&#x1F399;</button>'\",\n  \"        +'</div></td>'\",\n  \"        +'</tr>';\",\n  \"    }).join('');\",\n  \"    return '<div class=\\\"ub\\\" id=\\\"ub-'+user+'\\\">'\",\n  \"      +'<div class=\\\"uh\\\" onclick=\\\"toggleUser(\\\\'' + user + '\\\\')\\\"><span class=\\\"ue\\\">'+user+'</span>'\",\n  \"      +'<div class=\\\"us\\\">'\",\n  \"        +'<span class=\\\"ut\\\">'+calls.length+' calls</span>'\",\n  \"        +'<span class=\\\"ut dur\\\">'+fmtDur(totDur)+' total</span>'\",\n  \"        +'<span class=\\\"ut pos\\\">+'+avgPos+'% pos</span>'\",\n  \"        +'<span class=\\\"ut neg\\\">-'+avgNeg+'% neg</span>'\",\n  \"      +'</div><span class=\\\"ei\\\">&#9654;</span></div>'\",\n  \"      +'<table class=\\\"ct\\\"><thead><tr>'\",\n  \"        +'<th>Direction</th><th>Date/Time</th><th>Duration</th>'\",\n  \"        +'<th>Caller</th><th>Device</th><th>Sentiment</th><th>Actions</th>'\",\n  \"      +'</tr></thead><tbody>'+rows+'</tbody></table>'\",\n  \"    +'</div>';\",\n  \"  }).join('');\",\n  \"}\",\n\n  \"function toggleUser(user){\",\n  \"  var b=document.getElementById('ub-'+user);\",\n  \"  if(b)b.classList.toggle('open');\",\n  \"}\",\n\n  \"function exportCSV(){\",\n  \"  var cols=['base_user','device_type','call_direction','call_batch_start_datetime',\",\n  \"    'call_talking_duration_seconds','call_orig_caller_id','call_orig_from_name',\",\n  \"    'call_term_user','call_through_action',\",\n  \"    'call_intelligence_percent_positive','call_intelligence_percent_neutral',\",\n  \"    'call_intelligence_percent_negative','call_intelligence_topics_top',\",\n  \"    'call_disposition','call_account_code','cdr_id',\",\n  \"    'call_intelligence_job_id','call_orig_call_id','call_term_call_id'];\",\n  \"  function esc(v){\",\n  \"    if(v===null||v===undefined)return '';\",\n  \"    var s=String(v);\",\n  \"    return (s.indexOf(',')>=0||s.indexOf('\\\"')>=0||s.indexOf('\\\\n')>=0)\",\n  \"      ? '\\\"'+s.replace(/\\\"/g,'\\\"\\\"')+'\\\"' : s;\",\n  \"  }\",\n  \"  var lines=[cols.join(',')];\",\n  \"  filtered.forEach(function(r){lines.push(cols.map(function(c){return esc(r[c]);}).join(','));});\",\n  \"  var blob=new Blob([lines.join('\\\\n')],{type:'text/csv'});\",\n  \"  var a=document.createElement('a');\",\n  \"  a.href=URL.createObjectURL(blob);\",\n  \"  a.download='cdr_export_'+new Date().toISOString().slice(0,10)+'.csv';\",\n  \"  a.click();\",\n  \"}\",\n\n  \"applyFilters();\"\n].join('\\n');\n\n// ── HTML Body ───────────────────────────────────────────────\nconst body = [\n  '<div class=\"topbar\">',\n    '<h1>CDR <span>Dashboard</span></h1>',\n    '<div class=\"topbar-right\">',\n      '<span class=\"count-badge\" id=\"cnt\"></span>',\n      '<button class=\"btn bp\" onclick=\"exportCSV()\">&#11015; Export CSV</button>',\n    '</div>',\n  '</div>',\n\n  '<div class=\"filters\">',\n    '<div class=\"fg\"><label>Direction</label>',\n      '<select id=\"fDir\" onchange=\"applyFilters()\">',\n        '<option value=\"\">All</option>',\n        '<option value=\"1\">Inbound</option>',\n        '<option value=\"2\">Outbound</option>',\n        '<option value=\"3\">Missed</option>',\n      '</select>',\n    '</div>',\n    '<div class=\"fg\"><label>Min Duration (sec)</label>',\n      '<div class=\"rw\">',\n        '<input type=\"range\" id=\"fDur\" min=\"0\" max=\"600\" value=\"0\" oninput=\"document.getElementById(\\'fDurV\\').textContent=this.value;applyFilters()\">',\n        '<span class=\"rv\" id=\"fDurV\">0</span>',\n      '</div>',\n    '</div>',\n    '<div class=\"fg\"><label>Sentiment Type</label>',\n      '<div class=\"sbtns\">',\n        '<button class=\"sb\" id=\"bPos\" onclick=\"toggleSent(\\'pos\\')\">+ Pos</button>',\n        '<button class=\"sb\" id=\"bNeu\" onclick=\"toggleSent(\\'neu\\')\">~ Neu</button>',\n        '<button class=\"sb\" id=\"bNeg\" onclick=\"toggleSent(\\'neg\\')\">&minus; Neg</button>',\n      '</div>',\n    '</div>',\n    '<div class=\"fg\"><label>Sentiment Threshold %</label>',\n      '<div class=\"rw\">',\n        '<input type=\"range\" id=\"fST\" min=\"0\" max=\"100\" value=\"0\" oninput=\"document.getElementById(\\'fSTV\\').textContent=this.value+\\'%\\';applyFilters()\">',\n        '<span class=\"rv\" id=\"fSTV\">0%</span>',\n      '</div>',\n    '</div>',\n    '<div class=\"fg\"><label>User Search</label>',\n      '<input type=\"text\" id=\"fUser\" placeholder=\"ext. number...\" oninput=\"applyFilters()\">',\n    '</div>',\n    '<div class=\"fg\" style=\"justify-content:flex-end\">',\n      '<button class=\"btn bo\" onclick=\"resetFilters()\">Reset</button>',\n    '</div>',\n  '</div>',\n\n  '<div class=\"summary\" id=\"cards\"></div>',\n  '<div class=\"ts\" id=\"tbl\"></div>'\n].join('');\n\n// ── Assemble final HTML ─────────────────────────────────────\nconst html = '<!DOCTYPE html>'\n  + '<html lang=\"en\"><head>'\n  + '<meta charset=\"UTF-8\">'\n  + '<meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\">'\n  + '<title>CDR Dashboard</title>'\n  + '<style>' + css + '</style>'\n  + '</head><body>'\n  + body\n  + '<script>' + embeddedJs + '<\\/script>'\n  + '</body></html>';\n\nreturn [{ json: { html: html } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        0
+      ],
+      "id": "3079d4d5-b955-4fbf-9513-793afeaa129c",
+      "name": "Build Dashboard HTML"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        480,
+        0
+      ],
+      "id": "e3ece3ae-9a1b-4c25-a263-6a0524e0e5cc",
+      "name": "Respond — Send Dashboard"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5cf0e634-2a03-4fa6-acf2-c539f3c4a64f",
+              "name": "Config — Edit Here",
+              "value": "={{ $vars.GLOBAL_DOMAIN }}",
+              "type": "string"
+            },
+            {
+              "id": "e149cb37-78ab-49a0-8439-dc72f9ee2f41",
+              "name": "NS_SERVER",
+              "value": "={{ $vars.PROD_SERVER }}",
+              "type": "string"
+            },
+            {
+              "id": "e4b10cd1-5316-4138-8675-6bc0ae65540e",
+              "name": "DAYS_BACK",
+              "value": "30",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        0
+      ],
+      "id": "1c895500-dc42-4e90-94ee-e6b8dd04cdb9",
+      "name": "Config - Edit Here"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook — CDR Dashboard": {
+      "main": [
+        [
+          {
+            "node": "Config - Edit Here",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Date Range": {
+      "main": [
+        [
+          {
+            "node": "Query Supabase CDRs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Supabase CDRs": {
+      "main": [
+        [
+          {
+            "node": "Group by Base User",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group by Base User": {
+      "main": [
+        [
+          {
+            "node": "Build Dashboard HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dashboard HTML": {
+      "main": [
+        [
+          {
+            "node": "Respond — Send Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config - Edit Here": {
+      "main": [
+        [
+          {
+            "node": "Calculate Date Range",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "REDACTED",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "REDACTED"
+  },
+  "id": "mJkbuSRFOJvsWZ8h",
+  "tags": [
+    {
+      "name": "netsapiens",
+      "id": "qt839qdputTzaNNg",
+      "updatedAt": "2026-03-15T00:36:43.693Z",
+      "createdAt": "2026-03-15T00:36:43.693Z"
+    }
+  ]
+}
