@@ -1,0 +1,2452 @@
+{
+  "_comment_1": "This workflow fetches CDRs from the Netsapiens API and stores them in a database.",
+  "_comment_2": "Author: Allan Aquino Vieira",
+  "name": "Domain weekday CDR to DB",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "=https://{{ $('Configuration').item.json.NS_SERVER }}/ns-api/v2/domains/{{ $('Configuration').item.json.DOMAIN }}/cdrs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "=datetime-start",
+              "value": "={{ $json.START_DATETIME }}"
+            },
+            {
+              "name": "datetime-end",
+              "value": "={{ $json.END_DATETIME }}"
+            },
+            {
+              "name": "limit",
+              "value": "={{ $json.LIMIT }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json"
+            },
+            {
+              "name": "authorization",
+              "value": "Bearer TOKEN"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "name": "offset",
+                    "value": "={{ $pageCount * $json.LIMIT }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !Array.isArray($response.body) || $response.body.length < $json.LIMIT }}",
+              "limitPagesFetched": true,
+              "maxRequests": 1000
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -384,
+        -144
+      ],
+      "id": "c019faac-ddbd-4e41-b466-9051d445db15",
+      "name": "GET CDRs (v2 API)",
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "WJNaeJlDIS1sqHMy",
+          "name": "<Bearer Token>"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 * * 2-6"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -880,
+        -48
+      ],
+      "id": "bae384b4-7768-4f90-9d37-fc948c010d50",
+      "name": "Schedule Trigger (Tue–Sat 00:00)",
+      "notesInFlow": false,
+      "notes": "Fires every weekday at midnight (00:00) server time.\\nCron: 0 0 * * 1-5\nWhen running on schedule the workflow uses whatever\nDATE_START / DATE_END is set in the Configuration node.\nFor a daily run that always pulls the previous day only,\nset DATE_START and DATE_END both to:\\n  ={{ $now.minus({days:1}).toISO().substring(0,10) }}"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        -272
+      ],
+      "id": "fb278c01-49aa-45e0-b121-c8dfa18685ac",
+      "name": "Manual Trigger"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate yesterday's full-day window.\n// Because the schedule runs Tue–Sat, 'yesterday' always resolves to Mon–Fri.\n// On a manual trigger it also uses the previous calendar day.\n         \n  const now = new Date();\n  const yesterday = new Date(now);\n  yesterday.setDate(now.getDate() - 1);\n  const pad = n => String(n).padStart(2, '0');\n  const y = yesterday.getFullYear();\n  const m = pad(yesterday.getMonth() + 1);\n  const d = pad(yesterday.getDate());\n  const cfg = $input.first().json;\n  return [{\n    json: {\n      DOMAIN:         cfg.DOMAIN,\n      BASE_URL:       cfg.BASE_URL,\n      START_DATETIME: `${y}-${m}-${d} 00:00:00`,\n      END_DATETIME:   `${y}-${m}-${d} 23:59:59`,\n      FETCH_DATE:     `${y}-${m}-${d}`,\n      LIMIT:          '100'\n    }\n  }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        -144
+      ],
+      "id": "2a05e59e-bdef-456f-bfe5-0b0842febc5d",
+      "name": "Calculate Date Range"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "2288e91c-2625-4658-b3fe-b89699b316fd",
+              "name": "DOMAIN",
+              "value": "={{ $vars.GLOBAL_DOMAIN }}",
+              "type": "string"
+            },
+            {
+              "id": "1a2bc98d-ba7d-41f0-be79-f866d703d56f",
+              "name": "NS_SERVER",
+              "value": "={{ $vars.PROD_SERVER }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -720,
+        -144
+      ],
+      "id": "39b34633-b0f7-4c0d-8a01-757c01f2f4c7",
+      "name": "Configuration"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// Netsapiens CDR Field Mapper — Full field set\n// Based on actual API v2 response from api.simplicityvoip.com\n// ============================================================\n\nconst items = $input.all();\nconst mapped = [];\n\nfor (const item of items) {\n  const raw = item.json;\n  if (!raw['id'] && !raw['call-orig-call-id']) continue;\n\n  // Type-safe coercers\n  const str  = v => (v !== undefined && v !== null) ? String(v) : null;\n  const int  = v => (v !== undefined && v !== null && v !== '') ? parseInt(v, 10) : null;\n  const bool = v => (v !== undefined && v !== null) ? Boolean(v) : null;\n\n  mapped.push({\n    json: {\n\n      // ── API identifiers ──────────────────────────────────\n      cdr_id:                              str(raw['id']),          // root \"id\" field\n      domain:                              str(raw['domain']),\n      reseller:                            str(raw['reseller']),\n      core_server:                         str(raw['core-server']),\n\n      // ── Call identifiers ─────────────────────────────────\n      call_orig_call_id:                   str(raw['call-orig-call-id']),\n      call_parent_call_id:                 str(raw['call-parent-call-id']),\n      call_parent_cdr_id:                  str(raw['call-parent-cdr-id']),\n      call_term_call_id:                   str(raw['call-term-call-id']),\n      call_through_call_id:                str(raw['call-through-call-id']),\n      call_tag:                            str(raw['call-tag']),\n\n      // ── Call basics ───────────────────────────────────────\n      // NOTE: call-direction returns integer (1), not string\n      call_direction:                      str(raw['call-direction']),\n      call_routing_class:                  int(raw['call-routing-class']),\n      call_routing_match_uri:              str(raw['call-routing-match-uri']),\n      call_server_mac_address:             str(raw['call-server-mac-address']),\n\n      // ── Datetimes ─────────────────────────────────────────\n      call_start_datetime:                 raw['call-start-datetime']               ?? null,\n      call_ringing_datetime:               raw['call-ringing-datetime']             ?? null,\n      call_answer_datetime:                raw['call-answer-datetime']              ?? null,\n      call_disconnect_datetime:            raw['call-disconnect-datetime']          ?? null,\n      call_record_creation_datetime:       raw['call-record-creation-datetime']     ?? null,\n\n      // ── Durations ─────────────────────────────────────────\n      call_talking_duration_seconds:       int(raw['call-talking-duration-seconds']),\n      call_total_duration_seconds:         int(raw['call-total-duration-seconds']),\n      call_on_hold_duration_seconds:       int(raw['call-on-hold-duration-seconds']),\n      call_disconnect_reason_text:         str(raw['call-disconnect-reason-text']),\n\n      // ── Batch (multi-leg grouping) ────────────────────────\n      call_batch_answer_datetime:          raw['call-batch-answer-datetime']        ?? null,\n      call_batch_start_datetime:           raw['call-batch-start-datetime']         ?? null,\n      call_batch_sequence_marker:          str(raw['call-batch-sequence-marker']),\n      call_batch_total_duration_seconds:   int(raw['call-batch-total-duration-seconds']),\n      call_batch_on_hold_duration_seconds: int(raw['call-batch-on-hold-duration-seconds']),\n      call_leg_ordinal_index:              int(raw['call-leg-ordinal-index']),\n\n      // ── Origination (caller) ──────────────────────────────\n      call_orig_caller_id:                 str(raw['call-orig-caller-id']),\n      call_orig_from_name:                 str(raw['call-orig-from-name']),\n      call_orig_from_user:                 str(raw['call-orig-from-user']),\n      call_orig_from_host:                 str(raw['call-orig-from-host']),\n      call_orig_from_uri:                  str(raw['call-orig-from-uri']),\n      call_orig_to_user:                   str(raw['call-orig-to-user']),\n      call_orig_to_host:                   str(raw['call-orig-to-host']),\n      call_orig_to_uri:                    str(raw['call-orig-to-uri']),\n      call_orig_request_user:              str(raw['call-orig-request-user']),\n      call_orig_request_host:              str(raw['call-orig-request-host']),\n      call_orig_request_uri:               str(raw['call-orig-request-uri']),\n      call_orig_pre_routing_uri:           str(raw['call-orig-pre-routing-uri']),\n      call_orig_match_uri:                 str(raw['call-orig-match-uri']),\n      call_orig_ip_address:                str(raw['call-orig-ip-address']),\n      call_orig_domain:                    str(raw['call-orig-domain']),\n      call_orig_reseller:                  str(raw['call-orig-reseller']),\n      call_orig_department:                str(raw['call-orig-department']),\n      call_orig_site:                      str(raw['call-orig-site']),\n      call_orig_user:                      str(raw['call-orig-user']),\n\n      // ── Termination (called party) ────────────────────────\n      call_term_caller_id:                 str(raw['call-term-caller-id']),\n      call_term_to_uri:                    str(raw['call-term-to-uri']),\n      call_term_match_uri:                 str(raw['call-term-match-uri']),\n      call_term_pre_routing_uri:           str(raw['call-term-pre-routing-uri']),\n      call_term_ip_address:                str(raw['call-term-ip-address']),\n      call_term_domain:                    str(raw['call-term-domain']),\n      call_term_reseller:                  str(raw['call-term-reseller']),\n      call_term_department:                str(raw['call-term-department']),\n      call_term_site:                      str(raw['call-term-site']),\n      call_term_user:                      str(raw['call-term-user']),\n\n      // ── Through / transfer leg ────────────────────────────\n      call_through_action:                 str(raw['call-through-action']),\n      call_through_caller_id:              str(raw['call-through-caller-id']),\n      call_through_uri:                    str(raw['call-through-uri']),\n      call_through_domain:                 str(raw['call-through-domain']),\n      call_through_reseller:               str(raw['call-through-reseller']),\n      call_through_department:             str(raw['call-through-department']),\n      call_through_site:                   str(raw['call-through-site']),\n      call_through_user:                   str(raw['call-through-user']),\n\n      // ── Audio relay ───────────────────────────────────────\n      call_audio_codec:                     str(raw['call-audio-codec']),\n      call_audio_relay_side_a_local_port:   int(raw['call-audio-relay-side-a-local-port']),\n      call_audio_relay_side_a_remote_ip:    str(raw['call-audio-relay-side-a-remote-ip']),\n      call_audio_relay_side_a_packet_count: int(raw['call-audio-relay-side-a-packet-count']),\n      call_audio_relay_side_b_remote_ip:    str(raw['call-audio-relay-side-b-remote-ip']),\n      call_audio_relay_side_b_packet_count: int(raw['call-audio-relay-side-b-packet-count']),\n\n      // ── Video relay ───────────────────────────────────────\n      call_video_codec:                     str(raw['call-video-codec']),\n      call_video_relay_side_a_local_port:   int(raw['call-video-relay-side-a-local-port']),\n      call_video_relay_side_a_remote_ip:    str(raw['call-video-relay-side-a-remote-ip']),\n      call_video_relay_side_a_packet_count: int(raw['call-video-relay-side-a-packet-count']),\n      call_video_relay_side_b_remote_ip:    str(raw['call-video-relay-side-b-remote-ip']),\n      call_video_relay_side_b_packet_count: int(raw['call-video-relay-side-b-packet-count']),\n\n      // ── Fax relay ─────────────────────────────────────────\n      call_fax_codec:                       str(raw['call-fax-codec']),\n      call_fax_relay_side_a_local_port:     int(raw['call-fax-relay-side-a-local-port']),\n      call_fax_relay_side_a_remote_ip:      str(raw['call-fax-relay-side-a-remote-ip']),\n      call_fax_relay_side_a_packet_count:   int(raw['call-fax-relay-side-a-packet-count']),\n      call_fax_relay_side_b_remote_ip:      str(raw['call-fax-relay-side-b-remote-ip']),\n      call_fax_relay_side_b_packet_count:   int(raw['call-fax-relay-side-b-packet-count']),\n\n      // ── Intelligence / sentiment ──────────────────────────\n      call_intelligence_job_id:             int(raw['call-intelligence-job-id']),\n      call_intelligence_percent_positive:   int(raw['call-intelligence-percent-positive']),\n      call_intelligence_percent_neutral:    int(raw['call-intelligence-percent-neutral']),\n      call_intelligence_percent_negative:   int(raw['call-intelligence-percent-negative']),\n      call_intelligence_topics_top:         str(raw['call-intelligence-topics-top']),\n      ending_sentiment:                     int(raw['ending_sentiment']),\n\n      // ── Disposition ───────────────────────────────────────\n      call_disposition:                    str(raw['call-disposition']),\n      call_disposition_direction:          str(raw['call-disposition-direction']),\n      call_disposition_notes:              str(raw['call-disposition-notes']),\n      call_disposition_reason:             str(raw['call-disposition-reason']),\n      call_disposition_submitted_datetime: raw['call-disposition-submitted-datetime'] ?? null,\n\n      // ── Billing ───────────────────────────────────────────\n      call_account_code:                   str(raw['call-account-code']),\n\n      // ── Trace / debug links ───────────────────────────────\n      prefilled_trace_api:                 str(raw['prefilled-trace-api']),\n      prefilled_transcription_api:         str(raw['prefilled-transcription-api']),\n\n      // ── Flags ─────────────────────────────────────────────\n      hide_from_results:                   int(raw['hide-from-results']),\n      is_trace_expected:                   bool(raw['is-trace-expected'])\n    }\n  });\n}\n\nif (mapped.length === 0) {\n  return [{ json: { _skipped: true, reason: 'No CDRs returned for this date range' } }];\n}\n\nreturn mapped;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -192,
+        -240
+      ],
+      "id": "ed6945a7-7e77-49dc-9ece-f6cf91b6c431",
+      "name": "Map CDR Fields"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "40695ccc-47e2-4849-8b4a-471938eca585",
+              "leftValue": "={{ $json._skipped }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        0,
+        -240
+      ],
+      "id": "c47fa039-3262-47e4-97c7-9c4d2272e2d1",
+      "name": "Has Records?"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "netsapiens_cdrs",
+          "mode": "list",
+          "cachedResultName": "netsapiens_cdrs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "is_trace_expected": false,
+            "row_id": 0,
+            "call_routing_class": 0,
+            "call_talking_duration_seconds": 0,
+            "call_total_duration_seconds": 0,
+            "call_on_hold_duration_seconds": 0,
+            "call_batch_total_duration_seconds": 0,
+            "call_batch_on_hold_duration_seconds": 0,
+            "call_leg_ordinal_index": 0,
+            "call_audio_relay_side_a_local_port": 0,
+            "call_audio_relay_side_a_packet_count": 0,
+            "call_audio_relay_side_b_packet_count": 0,
+            "call_video_relay_side_a_local_port": 0,
+            "call_video_relay_side_a_packet_count": 0,
+            "call_video_relay_side_b_packet_count": 0,
+            "call_fax_relay_side_a_local_port": 0,
+            "call_fax_relay_side_a_packet_count": 0,
+            "call_fax_relay_side_b_packet_count": 0,
+            "call_intelligence_job_id": 0,
+            "call_intelligence_percent_positive": 0,
+            "call_intelligence_percent_neutral": 0,
+            "call_intelligence_percent_negative": 0,
+            "ending_sentiment": 0,
+            "hide_from_results": 0
+          },
+          "matchingColumns": [
+            "cdr_id"
+          ],
+          "schema": [
+            {
+              "id": "row_id",
+              "displayName": "row_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "fetched_at",
+              "displayName": "fetched_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "cdr_id",
+              "displayName": "cdr_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "reseller",
+              "displayName": "reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "core_server",
+              "displayName": "core_server",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_call_id",
+              "displayName": "call_orig_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_parent_call_id",
+              "displayName": "call_parent_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_parent_cdr_id",
+              "displayName": "call_parent_cdr_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_call_id",
+              "displayName": "call_term_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_call_id",
+              "displayName": "call_through_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_tag",
+              "displayName": "call_tag",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_direction",
+              "displayName": "call_direction",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_routing_class",
+              "displayName": "call_routing_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_routing_match_uri",
+              "displayName": "call_routing_match_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_server_mac_address",
+              "displayName": "call_server_mac_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_start_datetime",
+              "displayName": "call_start_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_ringing_datetime",
+              "displayName": "call_ringing_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_answer_datetime",
+              "displayName": "call_answer_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_disconnect_datetime",
+              "displayName": "call_disconnect_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_record_creation_datetime",
+              "displayName": "call_record_creation_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_talking_duration_seconds",
+              "displayName": "call_talking_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_total_duration_seconds",
+              "displayName": "call_total_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_on_hold_duration_seconds",
+              "displayName": "call_on_hold_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_disconnect_reason_text",
+              "displayName": "call_disconnect_reason_text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_batch_answer_datetime",
+              "displayName": "call_batch_answer_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_batch_start_datetime",
+              "displayName": "call_batch_start_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_batch_sequence_marker",
+              "displayName": "call_batch_sequence_marker",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_batch_total_duration_seconds",
+              "displayName": "call_batch_total_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_batch_on_hold_duration_seconds",
+              "displayName": "call_batch_on_hold_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_leg_ordinal_index",
+              "displayName": "call_leg_ordinal_index",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_caller_id",
+              "displayName": "call_orig_caller_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_from_name",
+              "displayName": "call_orig_from_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_from_user",
+              "displayName": "call_orig_from_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_from_host",
+              "displayName": "call_orig_from_host",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_from_uri",
+              "displayName": "call_orig_from_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_to_user",
+              "displayName": "call_orig_to_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_to_host",
+              "displayName": "call_orig_to_host",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_to_uri",
+              "displayName": "call_orig_to_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_request_user",
+              "displayName": "call_orig_request_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_request_host",
+              "displayName": "call_orig_request_host",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_request_uri",
+              "displayName": "call_orig_request_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_pre_routing_uri",
+              "displayName": "call_orig_pre_routing_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_match_uri",
+              "displayName": "call_orig_match_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_ip_address",
+              "displayName": "call_orig_ip_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_domain",
+              "displayName": "call_orig_domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_reseller",
+              "displayName": "call_orig_reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_department",
+              "displayName": "call_orig_department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_site",
+              "displayName": "call_orig_site",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_orig_user",
+              "displayName": "call_orig_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_caller_id",
+              "displayName": "call_term_caller_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_to_uri",
+              "displayName": "call_term_to_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_match_uri",
+              "displayName": "call_term_match_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_pre_routing_uri",
+              "displayName": "call_term_pre_routing_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_ip_address",
+              "displayName": "call_term_ip_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_domain",
+              "displayName": "call_term_domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_reseller",
+              "displayName": "call_term_reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_department",
+              "displayName": "call_term_department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_site",
+              "displayName": "call_term_site",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_term_user",
+              "displayName": "call_term_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_action",
+              "displayName": "call_through_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_caller_id",
+              "displayName": "call_through_caller_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_uri",
+              "displayName": "call_through_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_domain",
+              "displayName": "call_through_domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_reseller",
+              "displayName": "call_through_reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_department",
+              "displayName": "call_through_department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_site",
+              "displayName": "call_through_site",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_through_user",
+              "displayName": "call_through_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_audio_codec",
+              "displayName": "call_audio_codec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_audio_relay_side_a_local_port",
+              "displayName": "call_audio_relay_side_a_local_port",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_audio_relay_side_a_remote_ip",
+              "displayName": "call_audio_relay_side_a_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_audio_relay_side_a_packet_count",
+              "displayName": "call_audio_relay_side_a_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_audio_relay_side_b_remote_ip",
+              "displayName": "call_audio_relay_side_b_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_audio_relay_side_b_packet_count",
+              "displayName": "call_audio_relay_side_b_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_video_codec",
+              "displayName": "call_video_codec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_video_relay_side_a_local_port",
+              "displayName": "call_video_relay_side_a_local_port",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_video_relay_side_a_remote_ip",
+              "displayName": "call_video_relay_side_a_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_video_relay_side_a_packet_count",
+              "displayName": "call_video_relay_side_a_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_video_relay_side_b_remote_ip",
+              "displayName": "call_video_relay_side_b_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_video_relay_side_b_packet_count",
+              "displayName": "call_video_relay_side_b_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_fax_codec",
+              "displayName": "call_fax_codec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_fax_relay_side_a_local_port",
+              "displayName": "call_fax_relay_side_a_local_port",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_fax_relay_side_a_remote_ip",
+              "displayName": "call_fax_relay_side_a_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_fax_relay_side_a_packet_count",
+              "displayName": "call_fax_relay_side_a_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_fax_relay_side_b_remote_ip",
+              "displayName": "call_fax_relay_side_b_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_fax_relay_side_b_packet_count",
+              "displayName": "call_fax_relay_side_b_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_intelligence_job_id",
+              "displayName": "call_intelligence_job_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_intelligence_percent_positive",
+              "displayName": "call_intelligence_percent_positive",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_intelligence_percent_neutral",
+              "displayName": "call_intelligence_percent_neutral",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_intelligence_percent_negative",
+              "displayName": "call_intelligence_percent_negative",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_intelligence_topics_top",
+              "displayName": "call_intelligence_topics_top",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "ending_sentiment",
+              "displayName": "ending_sentiment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_disposition",
+              "displayName": "call_disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_disposition_direction",
+              "displayName": "call_disposition_direction",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_disposition_notes",
+              "displayName": "call_disposition_notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_disposition_reason",
+              "displayName": "call_disposition_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_disposition_submitted_datetime",
+              "displayName": "call_disposition_submitted_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "call_account_code",
+              "displayName": "call_account_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "prefilled_trace_api",
+              "displayName": "prefilled_trace_api",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "prefilled_transcription_api",
+              "displayName": "prefilled_transcription_api",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "hide_from_results",
+              "displayName": "hide_from_results",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "is_trace_expected",
+              "displayName": "is_trace_expected",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "canBeUsedToMatch": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        272,
+        -256
+      ],
+      "id": "41605dd2-b1b1-4b38-82e3-92abe8511746",
+      "name": "Insert or update rows in a table",
+      "credentials": {
+        "postgres": {
+          "id": "kXGNgOuzwKI9wrmg",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Take the keys from the CDR JSON and build a CSV header\nconst obj = $json;\n\n// Original NetSapiens keys, e.g. \"call-orig-caller-id\"\nconst originalKeys = Object.keys(obj);\n\n// Sanitize for n8n Data Table column IDs:\n// - replace \"-\" with \"_\"\n// - remove spaces\n// (you can adjust this to your naming preference)\nconst sanitizedKeys = originalKeys.map(k =>\n  k.replace(/-/g, '_').replace(/\\s+/g, '')\n);\n\n// Build a single header row\nconst headerRow = sanitizedKeys.join(',');\n\n// Optionally, also build a second row with the original keys\n// (for documentation or mapping) – not for import:\nconst originalRow = originalKeys.join(',');\n\n// Expose both so you can choose how to use them\nreturn [{\n  json: {\n    header: headerRow,\n    original: originalRow,\n  },\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -672,
+        208
+      ],
+      "id": "9d407b97-428b-4305-9f56-c2f3b53b1f98",
+      "name": "CDR keys to CSV",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1a4d1f59-1c1f-406d-ad60-437e7528424a",
+              "name": "csv",
+              "value": "={{ $json.header + \"\\n\" }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -464,
+        208
+      ],
+      "id": "ab7c56bb-e13d-4349-af1d-646e86c10b5c",
+      "name": "Add new line",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "csv",
+        "options": {
+          "encoding": "utf8",
+          "fileName": "cdr_table_schema.csv "
+        }
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        -256,
+        208
+      ],
+      "id": "9fb4e600-cfb9-4001-8f78-ee9245802edc",
+      "name": "Convert to File",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: items from HTTP Request where each item.json is a CDR object\n// Output: \n//   - items with .json.sanitized: object whose keys are safe column names\n//   - a single header item (first item) with .json.header: CSV header string\n\n// Helper: sanitize a NetSapiens field name to a n8n/DataTable-safe column ID\nfunction sanitizeKey(key) {\n  return key\n    .trim()\n    .toLowerCase()\n    .replace(/\\s+/g, '_')   // spaces -> _\n    .replace(/-/g, '_')     // hyphens -> _\n    .replace(/[^a-z0-9_]/g, ''); // drop anything weird\n}\n\n// 1) Build sanitized objects for every item\nconst sanitizedItems = items.map(item => {\n  const src = item.json;\n  const dst = {};\n  for (const [key, value] of Object.entries(src)) {\n    const col = sanitizeKey(key);\n    dst[col] = value;\n  }\n  // keep original around if you like\n  item.json = {\n    original: src,\n    sanitized: dst,\n  };\n  return item;\n});\n\n// 2) Build CSV header from sanitized keys of FIRST item\nif (sanitizedItems.length > 0) {\n  const firstSanitized = sanitizedItems[0].json.sanitized;\n  const headerCols = Object.keys(firstSanitized);\n  const header = headerCols.join(',');\n  // Attach the header to the FIRST item only\n  sanitizedItems[0].json.header = header;\n}\n\nreturn sanitizedItems;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -528,
+        400
+      ],
+      "id": "69c19a73-6774-4cda-81c1-f51c97815078",
+      "name": "Code in JavaScript",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "vw0gxOAMctbIYDMw",
+          "mode": "list",
+          "cachedResultName": "ns_cdr",
+          "cachedResultUrl": "/projects/jPybIowZA63K5zYi/datatables/vw0gxOAMctbIYDMw"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "cdr_id",
+              "keyValue": "=crd_id {{ $json.cdr_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "cdr_id",
+              "displayName": "cdr_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reseller",
+              "displayName": "reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_account_code",
+              "displayName": "call_account_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_answer_datetime",
+              "displayName": "call_answer_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_audio_codec",
+              "displayName": "call_audio_codec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_audio_relay_side_a_local_port",
+              "displayName": "call_audio_relay_side_a_local_port",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_audio_relay_side_a_packet_count",
+              "displayName": "call_audio_relay_side_a_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_audio_relay_side_a_remote_ip",
+              "displayName": "call_audio_relay_side_a_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_audio_relay_side_b_packet_count",
+              "displayName": "call_audio_relay_side_b_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_audio_relay_side_b_remote_ip",
+              "displayName": "call_audio_relay_side_b_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_batch_answer_datetime",
+              "displayName": "call_batch_answer_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_batch_on_hold_duration_seconds",
+              "displayName": "call_batch_on_hold_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_batch_sequence_marker",
+              "displayName": "call_batch_sequence_marker",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_batch_start_datetime",
+              "displayName": "call_batch_start_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_batch_total_duration_seconds",
+              "displayName": "call_batch_total_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_direction",
+              "displayName": "call_direction",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_disconnect_datetime",
+              "displayName": "call_disconnect_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_disconnect_reason_text",
+              "displayName": "call_disconnect_reason_text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_disposition",
+              "displayName": "call_disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_disposition_direction",
+              "displayName": "call_disposition_direction",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_disposition_notes",
+              "displayName": "call_disposition_notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_disposition_reason",
+              "displayName": "call_disposition_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_disposition_submitted_datetime",
+              "displayName": "call_disposition_submitted_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_fax_codec",
+              "displayName": "call_fax_codec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_fax_relay_side_a_local_port",
+              "displayName": "call_fax_relay_side_a_local_port",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_fax_relay_side_a_packet_count",
+              "displayName": "call_fax_relay_side_a_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_fax_relay_side_a_remote_ip",
+              "displayName": "call_fax_relay_side_a_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_fax_relay_side_b_packet_count",
+              "displayName": "call_fax_relay_side_b_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_fax_relay_side_b_remote_ip",
+              "displayName": "call_fax_relay_side_b_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_intelligence_job_id",
+              "displayName": "call_intelligence_job_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_intelligence_percent_negative",
+              "displayName": "call_intelligence_percent_negative",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_intelligence_percent_neutral",
+              "displayName": "call_intelligence_percent_neutral",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_intelligence_percent_positive",
+              "displayName": "call_intelligence_percent_positive",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_intelligence_topics_top",
+              "displayName": "call_intelligence_topics_top",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_leg_ordinal_index",
+              "displayName": "call_leg_ordinal_index",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_on_hold_duration_seconds",
+              "displayName": "call_on_hold_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_call_id",
+              "displayName": "call_orig_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_caller_id",
+              "displayName": "call_orig_caller_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_department",
+              "displayName": "call_orig_department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_domain",
+              "displayName": "call_orig_domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_from_host",
+              "displayName": "call_orig_from_host",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_from_name",
+              "displayName": "call_orig_from_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_from_uri",
+              "displayName": "call_orig_from_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_from_user",
+              "displayName": "call_orig_from_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_ip_address",
+              "displayName": "call_orig_ip_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_match_uri",
+              "displayName": "call_orig_match_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_pre_routing_uri",
+              "displayName": "call_orig_pre_routing_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_request_host",
+              "displayName": "call_orig_request_host",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_request_uri",
+              "displayName": "call_orig_request_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_request_user",
+              "displayName": "call_orig_request_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_reseller",
+              "displayName": "call_orig_reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_site",
+              "displayName": "call_orig_site",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_to_host",
+              "displayName": "call_orig_to_host",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_to_uri",
+              "displayName": "call_orig_to_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_to_user",
+              "displayName": "call_orig_to_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_orig_user",
+              "displayName": "call_orig_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_parent_call_id",
+              "displayName": "call_parent_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_parent_cdr_id",
+              "displayName": "call_parent_cdr_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_record_creation_datetime",
+              "displayName": "call_record_creation_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_ringing_datetime",
+              "displayName": "call_ringing_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_routing_class",
+              "displayName": "call_routing_class",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_routing_match_uri",
+              "displayName": "call_routing_match_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_server_mac_address",
+              "displayName": "call_server_mac_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_start_datetime",
+              "displayName": "call_start_datetime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_tag",
+              "displayName": "call_tag",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_talking_duration_seconds",
+              "displayName": "call_talking_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_call_id",
+              "displayName": "call_term_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_caller_id",
+              "displayName": "call_term_caller_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_department",
+              "displayName": "call_term_department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_domain",
+              "displayName": "call_term_domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_ip_address",
+              "displayName": "call_term_ip_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_match_uri",
+              "displayName": "call_term_match_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_pre_routing_uri",
+              "displayName": "call_term_pre_routing_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_reseller",
+              "displayName": "call_term_reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_site",
+              "displayName": "call_term_site",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_to_uri",
+              "displayName": "call_term_to_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_term_user",
+              "displayName": "call_term_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_action",
+              "displayName": "call_through_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_call_id",
+              "displayName": "call_through_call_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_caller_id",
+              "displayName": "call_through_caller_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_department",
+              "displayName": "call_through_department",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_domain",
+              "displayName": "call_through_domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_reseller",
+              "displayName": "call_through_reseller",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_site",
+              "displayName": "call_through_site",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_uri",
+              "displayName": "call_through_uri",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_through_user",
+              "displayName": "call_through_user",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_total_duration_seconds",
+              "displayName": "call_total_duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_video_codec",
+              "displayName": "call_video_codec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_video_relay_side_a_local_port",
+              "displayName": "call_video_relay_side_a_local_port",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_video_relay_side_a_packet_count",
+              "displayName": "call_video_relay_side_a_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_video_relay_side_a_remote_ip",
+              "displayName": "call_video_relay_side_a_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_video_relay_side_b_packet_count",
+              "displayName": "call_video_relay_side_b_packet_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "call_video_relay_side_b_remote_ip",
+              "displayName": "call_video_relay_side_b_remote_ip",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "core_server",
+              "displayName": "core_server",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ending_sentiment",
+              "displayName": "ending_sentiment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hide_from_results",
+              "displayName": "hide_from_results",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "is_trace_expected",
+              "displayName": "is_trace_expected",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "prefilled_trace_api",
+              "displayName": "prefilled_trace_api",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "prefilled_transcription_api",
+              "displayName": "prefilled_transcription_api",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        272,
+        -48
+      ],
+      "id": "d9b6beb0-0906-4f30-b6c1-f19509a0cbb1",
+      "name": "Upsert row(s)"
+    },
+    {
+      "parameters": {
+        "content": "## Header CSV generator\n**Deactivated**\nUsed to create Table/Database columns to accommodate date returned by API.",
+        "width": 288
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1024,
+        208
+      ],
+      "id": "bb22aa81-3bb1-4c39-b1e5-c990ef17ff81",
+      "name": "Sticky Note"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "GET CDRs (v2 API)": {
+      "main": [
+        [
+          {
+            "node": "Map CDR Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger (Tue–Sat 00:00)": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Date Range": {
+      "main": [
+        [
+          {
+            "node": "GET CDRs (v2 API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configuration": {
+      "main": [
+        [
+          {
+            "node": "Calculate Date Range",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map CDR Fields": {
+      "main": [
+        [
+          {
+            "node": "Has Records?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Records?": {
+      "main": [
+        [
+          {
+            "node": "Insert or update rows in a table",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Upsert row(s)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CDR keys to CSV": {
+      "main": [
+        [
+          {
+            "node": "Add new line",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add new line": {
+      "main": [
+        [
+          {
+            "node": "Convert to File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to File": {
+      "main": [
+        []
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        []
+      ]
+    },
+    "Insert or update rows in a table": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "REDACTED",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "REDACTED"
+  },
+  "id": "ghqrTZHg0LZeN36y",
+  "tags": [
+    {
+      "name": "netsapiens",
+      "id": "qt839qdputTzaNNg",
+      "updatedAt": "2026-03-15T00:36:43.693Z",
+      "createdAt": "2026-03-15T00:36:43.693Z"
+    }
+  ]
+}
